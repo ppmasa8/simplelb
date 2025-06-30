@@ -1,17 +1,34 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Backend struct {
 	URL          *url.URL
+	Alive        bool
+	mux          sync.RWMutex
 	ReverseProxy *httputil.ReverseProxy
+}
+
+func (b *Backend) SetAlive(alive bool) {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+	b.Alive = alive
+}
+
+func (b *Backend) IsAlive() bool {
+	b.mux.RLock()
+	defer b.mux.RUnlock()
+	return b.Alive
 }
 
 type ServerPool struct {
@@ -24,9 +41,48 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	l := len(s.backends) + next
 	for i := next; i < l; i++ {
 		idx := i % len(s.backends)
-		return s.backends[idx]
+		if s.backends[idx].IsAlive() {
+			if i != next {
+				atomic.StoreUint64(&s.current, uint64(idx))
+			}
+			return s.backends[idx]
+		}
 	}
 	return nil
+}
+
+func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
+	for _, b := range s.backends {
+		if b.URL.String() == backendUrl.String() {
+			b.SetAlive(alive)
+			break
+		}
+	}
+}
+
+func (s *ServerPool) HealthCheck() {
+	for _, b := range s.backends {
+		go func(backend *Backend) {
+			client := &http.Client{
+				Timeout: 5 * time.Second,
+			}
+
+			res, err := client.Get(backend.URL.String())
+			alive := err == nil && res.StatusCode >= 200 && res.StatusCode < 300
+
+			if res != nil {
+				res.Body.Close()
+			}
+
+			backend.SetAlive(alive)
+
+			status := "down"
+			if alive {
+				status = "up"
+			}
+			log.Printf("Health check - %s is %s", backend.URL.Host, status)
+		}(b)
+	}
 }
 
 func (s *ServerPool) loadBalance(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +95,21 @@ func (s *ServerPool) loadBalance(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
 }
 
+func (s *ServerPool) healthCheckRunner(ctx context.Context) {
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			log.Println("Starting health check...")
+			s.HealthCheck()
+		}
+	}
+}
+
 func NewBackend(serverURL string) (*Backend, error) {
 	u, err := url.Parse(serverURL)
 	if err != nil {
@@ -47,6 +118,7 @@ func NewBackend(serverURL string) (*Backend, error) {
 
 	return &Backend{
 		URL:          u,
+		Alive:        true,
 		ReverseProxy: httputil.NewSingleHostReverseProxy(u),
 	}, nil
 }
@@ -68,6 +140,15 @@ func main() {
 		serverPool.backends = append(serverPool.backends, be)
 		fmt.Printf("Added backend: %s\n", backend)
 	}
+
+	log.Println("Starting initial health check...")
+	serverPool.HealthCheck()
+	time.Sleep(2 * time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go serverPool.healthCheckRunner(ctx)
 
 	http.HandleFunc("/", serverPool.loadBalance)
 
