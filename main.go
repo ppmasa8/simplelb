@@ -4,12 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	MaxRetries   = 3
+	RetryKeyName = "retry"
 )
 
 type Backend struct {
@@ -60,9 +66,38 @@ func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
 	}
 }
 
+func GetRetryFromContext(r *http.Request) int {
+	if retry, ok := r.Context().Value(RetryKeyName).(int); ok {
+		return retry
+	}
+	return 0
+}
+
+func (s *ServerPool) loadBalance(w http.ResponseWriter, r *http.Request) {
+	attempts := GetRetryFromContext(r)
+	if attempts > MaxRetries {
+		log.Printf("Max retry attempts reached, terminating")
+		http.Error(w, "Service not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	peer := s.GetNextPeer()
+	if peer != nil {
+		log.Printf("Routing request to: %s", peer.URL.Host)
+		peer.ReverseProxy.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "Service not available", http.StatusServiceUnavailable)
+}
+
 func (s *ServerPool) HealthCheck() {
+	var wg sync.WaitGroup
+
 	for _, b := range s.backends {
+		wg.Add(1)
 		go func(backend *Backend) {
+			defer wg.Done()
+
 			client := &http.Client{
 				Timeout: 5 * time.Second,
 			}
@@ -83,16 +118,7 @@ func (s *ServerPool) HealthCheck() {
 			log.Printf("Health check - %s is %s", backend.URL.Host, status)
 		}(b)
 	}
-}
-
-func (s *ServerPool) loadBalance(w http.ResponseWriter, r *http.Request) {
-	peer := s.GetNextPeer()
-	if peer != nil {
-		log.Printf("Routing request to: %s", peer.URL.Host)
-		peer.ReverseProxy.ServeHTTP(w, r)
-		return
-	}
-	http.Error(w, "Service not available", http.StatusServiceUnavailable)
+	wg.Wait()
 }
 
 func (s *ServerPool) healthCheckRunner(ctx context.Context) {
@@ -116,12 +142,43 @@ func NewBackend(serverURL string) (*Backend, error) {
 		return nil, err
 	}
 
-	return &Backend{
+	proxy := httputil.NewSingleHostReverseProxy(u)
+
+	proxy.Transport = &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+
+	backend := &Backend{
 		URL:          u,
 		Alive:        true,
-		ReverseProxy: httputil.NewSingleHostReverseProxy(u),
-	}, nil
+		ReverseProxy: proxy,
+	}
+
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
+		log.Printf("Proxy error for %s: %v", u.Host, e)
+
+		backend.SetAlive(false)
+
+		retries := GetRetryFromContext(r)
+		log.Printf("Retrying request, attempt %d", retries+1)
+
+		ctx := context.WithValue(r.Context(), RetryKeyName, retries+1)
+
+		time.Sleep(10 * time.Millisecond)
+
+		serverPool.loadBalance(w, r.WithContext(ctx))
+	}
+
+	return backend, nil
 }
+
+var serverPool *ServerPool
 
 func main() {
 	backends := []string{
@@ -152,8 +209,22 @@ func main() {
 
 	http.HandleFunc("/", serverPool.loadBalance)
 
-	fmt.Println("Starting proxy server on :8080")
-	fmt.Printf("Configured %d backends\n", len(serverPool.backends))
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"backends": [`)
+		for i, b := range serverPool.backends {
+			if i > 0 {
+				fmt.Fprintf(w, `,`)
+			}
+			fmt.Fprintf(w, `{"url":"%s","alive":%t}`, b.URL.String(), b.IsAlive())
+		}
+		fmt.Fprintf(w, `]}`)
+	})
+
+	fmt.Println("Load Balancer started on :8080")
+	fmt.Printf("Health check interval: 10 seconds\n")
+	fmt.Printf("Max retries: %d\n", MaxRetries)
+	fmt.Println("Status endpoint: http://localhost:8080/status")
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
