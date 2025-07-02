@@ -2,27 +2,42 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const (
-	MaxRetries   = 3
-	RetryKeyName = "retry"
-)
+type Config struct {
+	Port                int      `json:"port"`
+	Backends            []string `json:"backends"`
+	HealthCheckPath     string   `json:"health_check_path"`
+	HealthCheckInterval int      `json:"health_check_interval"`
+	MaxRetries          int      `json:"max_retries"`
+	Timeout             int      `json:"timeout"`
+}
+
+type Metrics struct {
+	TotalRequests   uint64
+	SuccessRequests uint64
+	FailedRequests  uint64
+	HealthChecks    uint64
+}
 
 type Backend struct {
 	URL          *url.URL
 	Alive        bool
 	mux          sync.RWMutex
 	ReverseProxy *httputil.ReverseProxy
+	Requests     uint64
 }
 
 func (b *Backend) SetAlive(alive bool) {
@@ -37,9 +52,19 @@ func (b *Backend) IsAlive() bool {
 	return b.Alive
 }
 
+func (b *Backend) IncrementRequests() {
+	atomic.AddUint64(&b.Requests, 1)
+}
+
+func (b *Backend) GetRequestCount() uint64 {
+	return atomic.LoadUint64(&b.Requests)
+}
+
 type ServerPool struct {
 	backends []*Backend
 	current  uint64
+	config   *Config
+	metrics  *Metrics
 }
 
 func (s *ServerPool) GetNextPeer() *Backend {
@@ -57,25 +82,12 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	return nil
 }
 
-func (s *ServerPool) MarkBackendStatus(backendUrl *url.URL, alive bool) {
-	for _, b := range s.backends {
-		if b.URL.String() == backendUrl.String() {
-			b.SetAlive(alive)
-			break
-		}
-	}
-}
-
-func GetRetryFromContext(r *http.Request) int {
-	if retry, ok := r.Context().Value(RetryKeyName).(int); ok {
-		return retry
-	}
-	return 0
-}
-
 func (s *ServerPool) loadBalance(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&s.metrics.TotalRequests, 1)
+
 	attempts := GetRetryFromContext(r)
-	if attempts > MaxRetries {
+	if attempts > s.config.MaxRetries {
+		atomic.AddUint64(&s.metrics.FailedRequests, 1)
 		log.Printf("Max retry attempts reached, terminating")
 		http.Error(w, "Service not available", http.StatusServiceUnavailable)
 		return
@@ -83,26 +95,32 @@ func (s *ServerPool) loadBalance(w http.ResponseWriter, r *http.Request) {
 
 	peer := s.GetNextPeer()
 	if peer != nil {
-		log.Printf("Routing request to: %s", peer.URL.Host)
+		peer.IncrementRequests()
+		log.Printf("Attempt %d: Routing to: %s", attempts+1, peer.URL.Host)
 		peer.ReverseProxy.ServeHTTP(w, r)
+		atomic.AddUint64(&s.metrics.SuccessRequests, 1)
 		return
 	}
+
+	atomic.AddUint64(&s.metrics.FailedRequests, 1)
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
 }
 
 func (s *ServerPool) HealthCheck() {
-	var wg sync.WaitGroup
+	atomic.AddUint64(&s.metrics.HealthChecks, 1)
 
+	var wg sync.WaitGroup
 	for _, b := range s.backends {
 		wg.Add(1)
 		go func(backend *Backend) {
 			defer wg.Done()
 
 			client := &http.Client{
-				Timeout: 5 * time.Second,
+				Timeout: time.Duration(s.config.Timeout) * time.Second,
 			}
 
-			res, err := client.Get(backend.URL.String())
+			healthURL := backend.URL.String() + s.config.HealthCheckPath
+			res, err := client.Get(healthURL)
 			alive := err == nil && res.StatusCode >= 200 && res.StatusCode < 300
 
 			if res != nil {
@@ -122,7 +140,7 @@ func (s *ServerPool) HealthCheck() {
 }
 
 func (s *ServerPool) healthCheckRunner(ctx context.Context) {
-	ticker := time.NewTicker(20 * time.Second)
+	ticker := time.NewTicker(time.Duration(s.config.HealthCheckInterval) * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -136,7 +154,48 @@ func (s *ServerPool) healthCheckRunner(ctx context.Context) {
 	}
 }
 
-func NewBackend(serverURL string) (*Backend, error) {
+func (s *ServerPool) statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	status := struct {
+		Backends []struct {
+			URL      string `json:"url"`
+			Alive    bool   `json:"alive"`
+			Requests uint64 `json:"requests"`
+		} `json:"backends"`
+		Metrics *Metrics `json:"metrics"`
+	}{
+		Metrics: s.metrics,
+	}
+
+	for _, b := range s.backends {
+		status.Backends = append(status.Backends, struct {
+			URL      string `json:"url"`
+			Alive    bool   `json:"alive"`
+			Requests uint64 `json:"requests"`
+		}{
+			URL:      b.URL.String(),
+			Alive:    b.IsAlive(),
+			Requests: b.GetRequestCount(),
+		})
+	}
+
+	json.NewEncoder(w).Encode(status)
+}
+
+func (s *ServerPool) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.metrics)
+}
+
+func GetRetryFromContext(r *http.Request) int {
+	if retry, ok := r.Context().Value("retry").(int); ok {
+		return retry
+	}
+	return 0
+}
+
+func NewBackend(serverURL string, config *Config, serverPool *ServerPool) (*Backend, error) {
 	u, err := url.Parse(serverURL)
 	if err != nil {
 		return nil, err
@@ -149,7 +208,7 @@ func NewBackend(serverURL string) (*Backend, error) {
 		MaxIdleConnsPerHost: 10,
 		IdleConnTimeout:     90 * time.Second,
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
+			Timeout:   time.Duration(config.Timeout) * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
@@ -166,31 +225,65 @@ func NewBackend(serverURL string) (*Backend, error) {
 		backend.SetAlive(false)
 
 		retries := GetRetryFromContext(r)
-		log.Printf("Retrying request, attempt %d", retries+1)
-
-		ctx := context.WithValue(r.Context(), RetryKeyName, retries+1)
-
-		time.Sleep(10 * time.Millisecond)
-
-		serverPool.loadBalance(w, r.WithContext(ctx))
+		if retries < config.MaxRetries {
+			log.Printf("Retrying request, attempt $d", retries+1)
+			ctx := context.WithValue(r.Context(), "retry", retries+1)
+			time.Sleep(10 * time.Millisecond)
+			serverPool.loadBalance(w, r.WithContext(ctx))
+		} else {
+			atomic.AddUint64(&serverPool.metrics.FailedRequests, 1)
+			http.Error(w, "Service not available", http.StatusBadGateway)
+		}
 	}
 
 	return backend, nil
 }
 
-var serverPool *ServerPool
-
-func main() {
-	backends := []string{
-		"http://localhost:8081",
-		"http://localhost:8082",
-		"http://localhost:8083",
+func LoadConfig(filename string) (*Config, error) {
+	config := &Config{
+		Port:                8080,
+		Backends:            []string{"http://localhost:8081", "http://localhost:8082", "http://localhost:8083"},
+		HealthCheckPath:     "/",
+		HealthCheckInterval: 10,
+		MaxRetries:          3,
+		Timeout:             5,
 	}
 
-	serverPool := &ServerPool{}
+	if filename == "" {
+		return config, nil
+	}
 
-	for _, backend := range backends {
-		be, err := NewBackend(backend)
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Printf("Warning: Could not open config file %s, using default", filename)
+		return config, nil
+	}
+	defer file.Close()
+
+	if err := json.NewDecoder(file).Decode(config); err != nil {
+		return nil, fmt.Errorf("error parsing config file: %v", err)
+	}
+
+	return config, nil
+}
+
+func main() {
+	var configFile string
+	flag.StringVar(&configFile, "config", "", "Configuration file path")
+	flag.Parse()
+
+	config, err := LoadConfig(configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	serverPool := &ServerPool{
+		config:  config,
+		metrics: &Metrics{},
+	}
+
+	for _, backend := range config.Backends {
+		be, err := NewBackend(backend, config, serverPool)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -209,22 +302,22 @@ func main() {
 
 	http.HandleFunc("/", serverPool.loadBalance)
 
-	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/status", serverPool.statusHandler)
+	http.HandleFunc("/metrics", serverPool.metricsHandler)
+
+	http.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"backends": [`)
-		for i, b := range serverPool.backends {
-			if i > 0 {
-				fmt.Fprintf(w, `,`)
-			}
-			fmt.Fprintf(w, `{"url":"%s","alive":%t}`, b.URL.String(), b.IsAlive())
-		}
-		fmt.Fprintf(w, `]}`)
+		json.NewEncoder(w).Encode(config)
 	})
 
-	fmt.Println("Load Balancer started on :8080")
-	fmt.Printf("Health check interval: 10 seconds\n")
-	fmt.Printf("Max retries: %d\n", MaxRetries)
-	fmt.Println("Status endpoint: http://localhost:8080/status")
+	fmt.Printf("Load Balancer started on :%d\n", config.Port)
+	fmt.Printf("Backends: %v\n", config.Backends)
+	fmt.Printf("Health check interval: %d seconds\n", config.HealthCheckInterval)
+	fmt.Printf("Max retries: %d\n", config.MaxRetries)
+	fmt.Println("Management APIs:")
+	fmt.Printf("  Status:  http://localhost:%d/status\n", config.Port)
+	fmt.Printf("  Metrics: http://localhost:%d/metrics\n", config.Port)
+	fmt.Printf("  Config:  http://localhost:%d/config\n", config.Port)
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil))
 }
